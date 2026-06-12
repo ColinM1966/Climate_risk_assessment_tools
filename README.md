@@ -4,17 +4,17 @@
 
 
 
-<b>Coastal Inundation Exposure Assessment
+#Coastal Inundation Exposure Assessment
 
 This R workflow assesses coastal inundation exposure for any user-defined area of interest.
 
-Supported spatial inputs include:
+##Supported spatial inputs include:
 GeoPackage polygon layers
 ESRI Shapefiles
 KML files
 point locations, converted to assessment areas using a user-defined buffer
 
-The workflow:
+##The workflow:
 reads and validates the input spatial data;
 repairs invalid geometries;
 converts buffered points or multiple polygons into a single assessment unit;
@@ -26,7 +26,7 @@ creates cropped and masked inundation rasters where:
 0 = not inundated
 -9999 = NoData
 
-Required R packages
+##Required R packages:
 sf
 terra
 exactextractr
