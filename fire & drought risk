@@ -1,0 +1,1408 @@
+# ============================================================
+# AOI DROUGHT + FIRE CLIMATE RISK ASSESSMENT
+#
+# Example AOI:
+#   C:/Users/User/Documents/Climate_GT/Jambongan.gpkg
+#   Layer: Jambongan
+#
+# Current run:
+#   Baseline 1981-2010
+#   SSP245, 2041-2070
+#
+# The workflow can also process:
+#   SSP126, SSP245, SSP370 and SSP585
+#   2011-2040, 2041-2070 and 2071-2100
+#
+# Outputs:
+#   1. Dissolved AOI boundary
+#   2. Cropped and masked rasters
+#   3. Exact area-weighted raster statistics
+#   4. Baseline-versus-future change report
+#
+# Cropped raster values:
+#   Original raster values retained
+#   -9999 = NoData outside the AOI
+# ============================================================
+
+library(sf)
+library(terra)
+library(exactextractr)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(stringr)
+library(tibble)
+
+sf_use_s2(FALSE)
+
+# ------------------------------------------------------------
+# 0. USER SETTINGS
+# ------------------------------------------------------------
+
+# AOI location
+aoi_base_dir <- "C:/Users/User/Documents/Climate_GT"
+
+aoi_file <- file.path(
+  aoi_base_dir,
+  "Jambongan.gpkg"
+)
+
+aoi_layer <- "Jambongan"
+
+aoi_name <- "Jambongan"
+
+# Climate-data location
+climate_base_dir <- "C:/Users/User/Documents/Peatland/Climate"
+
+layers_dir <- file.path(
+  climate_base_dir,
+  "Layers"
+)
+
+baseline_dir <- file.path(
+  layers_dir,
+  "baseline"
+)
+
+# ------------------------------------------------------------
+# CURRENT RUN SELECTION
+# ------------------------------------------------------------
+
+# Process baseline?
+include_baseline <- TRUE
+
+# For the current run:
+selected_ssps <- c("ssp245")
+
+selected_periods <- c("2041-2070")
+
+# To run every SSP and period later, use:
+#
+# selected_ssps <- c(
+#   "ssp126",
+#   "ssp245",
+#   "ssp370",
+#   "ssp585"
+# )
+#
+# selected_periods <- c(
+#   "2011-2040",
+#   "2041-2070",
+#   "2071-2100"
+# )
+
+# ------------------------------------------------------------
+# FOLDER-NAMING CONVENTION
+# ------------------------------------------------------------
+#
+# This assumes folders such as:
+#
+# Layers/ssp245-11-40
+# Layers/ssp245-41-70
+# Layers/ssp245-71-00
+#
+# Change these codes if your folders use different names.
+
+period_folder_codes <- c(
+  "2011-2040" = "11-40",
+  "2041-2070" = "41-70",
+  "2071-2100" = "71-00"
+)
+
+# ------------------------------------------------------------
+# OUTPUT DIRECTORIES
+# ------------------------------------------------------------
+
+out_dir <- file.path(
+  aoi_base_dir,
+  "outputs",
+  paste0(aoi_name, "_drought_fire")
+)
+
+table_out_dir <- file.path(
+  out_dir,
+  "tables"
+)
+
+raster_out_dir <- file.path(
+  out_dir,
+  "cropped_rasters"
+)
+
+vector_out_dir <- file.path(
+  out_dir,
+  "vectors"
+)
+
+dir.create(
+  table_out_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  raster_out_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  vector_out_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# ------------------------------------------------------------
+# 1. INDICATOR DEFINITIONS
+# ------------------------------------------------------------
+#
+# candidate_prefixes allow for minor capitalization
+# differences such as PPETmin versus PPETMin.
+
+indicator_definitions <- tribble(
+  ~indicator,   ~candidate_prefixes,                  ~extension,
+  "Bio05",      c("Bio05"),                           "tif",
+  "Bio17",      c("Bio17"),                           "tif",
+  "CDD",        c("CDD"),                             "tif",
+  "Fire",       c("Fire"),                            "asc",
+  "PPETdry",    c("PPETConDryMth"),                   "tif",
+  "PPETmin",    c("PPETmin", "PPETMin", "PPETMIN"),  "tif"
+)
+
+# ------------------------------------------------------------
+# 2. INPUT-CHECKING FUNCTIONS
+# ------------------------------------------------------------
+
+find_existing_file <- function(directory, candidate_names) {
+
+  if (!dir.exists(directory)) {
+    stop(
+      "Raster directory does not exist:\n",
+      directory
+    )
+  }
+
+  available_files <- list.files(
+    directory,
+    full.names = TRUE,
+    recursive = FALSE
+  )
+
+  available_basenames <- basename(
+    available_files
+  )
+
+  for (candidate in candidate_names) {
+
+    matched_position <- which(
+      tolower(available_basenames) ==
+        tolower(candidate)
+    )
+
+    if (length(matched_position) > 0) {
+      return(
+        available_files[
+          matched_position[1]
+        ]
+      )
+    }
+  }
+
+  stop(
+    "\nCould not find the required raster in:\n",
+    directory,
+    "\n\nTried these filenames:\n",
+    paste(candidate_names, collapse = "\n"),
+    "\n\nAvailable files include:\n",
+    paste(
+      head(available_basenames, 30),
+      collapse = "\n"
+    )
+  )
+}
+
+make_candidate_filenames <- function(
+    prefixes,
+    scenario,
+    period,
+    extension
+) {
+
+  map_chr(
+    prefixes,
+    function(prefix) {
+
+      if (scenario == "baseline") {
+
+        paste0(
+          prefix,
+          "_AllGCMs_historical_1981-2010.",
+          extension
+        )
+
+      } else {
+
+        paste0(
+          prefix,
+          "_AllGCMs_",
+          scenario,
+          "_",
+          period,
+          ".",
+          extension
+        )
+      }
+    }
+  )
+}
+
+# ------------------------------------------------------------
+# 3. CREATE RASTER CATALOGUE
+# ------------------------------------------------------------
+
+build_raster_catalogue <- function(
+    include_baseline,
+    selected_ssps,
+    selected_periods
+) {
+
+  catalogue_parts <- list()
+
+  # ----------------------------------------------------------
+  # BASELINE
+  # ----------------------------------------------------------
+
+  if (include_baseline) {
+
+    baseline_catalogue <- indicator_definitions %>%
+      mutate(
+        scenario = "baseline",
+        period = "1981-2010",
+        raster_directory = baseline_dir
+      ) %>%
+      rowwise() %>%
+      mutate(
+        candidate_names = list(
+          make_candidate_filenames(
+            prefixes = candidate_prefixes,
+            scenario = scenario,
+            period = period,
+            extension = extension
+          )
+        ),
+
+        raster_file = find_existing_file(
+          raster_directory,
+          candidate_names
+        )
+      ) %>%
+      ungroup() %>%
+      select(
+        indicator,
+        scenario,
+        period,
+        raster_file
+      )
+
+    catalogue_parts[["baseline"]] <-
+      baseline_catalogue
+  }
+
+  # ----------------------------------------------------------
+  # FUTURE SCENARIOS
+  # ----------------------------------------------------------
+
+  future_combinations <- expand_grid(
+    scenario = selected_ssps,
+    period = selected_periods
+  )
+
+  future_catalogue <- pmap_dfr(
+    future_combinations,
+    function(scenario, period) {
+
+      folder_code <- period_folder_codes[
+        period
+      ]
+
+      if (is.na(folder_code)) {
+        stop(
+          "No folder code is defined for period: ",
+          period
+        )
+      }
+
+      future_directory <- file.path(
+        layers_dir,
+        paste0(
+          scenario,
+          "-",
+          folder_code
+        )
+      )
+
+      indicator_definitions %>%
+        mutate(
+          scenario = scenario,
+          period = period,
+          raster_directory =
+            future_directory
+        ) %>%
+        rowwise() %>%
+        mutate(
+          candidate_names = list(
+            make_candidate_filenames(
+              prefixes =
+                candidate_prefixes,
+              scenario = scenario,
+              period = period,
+              extension = extension
+            )
+          ),
+
+          raster_file = find_existing_file(
+            raster_directory,
+            candidate_names
+          )
+        ) %>%
+        ungroup() %>%
+        select(
+          indicator,
+          scenario,
+          period,
+          raster_file
+        )
+    }
+  )
+
+  catalogue_parts[["future"]] <-
+    future_catalogue
+
+  bind_rows(
+    catalogue_parts
+  ) %>%
+    mutate(
+      scenario_period = if_else(
+        scenario == "baseline",
+        "baseline_1981-2010",
+        paste(
+          scenario,
+          period,
+          sep = "_"
+        )
+      )
+    ) %>%
+    arrange(
+      scenario,
+      period,
+      indicator
+    )
+}
+
+raster_catalogue <- build_raster_catalogue(
+  include_baseline = include_baseline,
+  selected_ssps = selected_ssps,
+  selected_periods = selected_periods
+)
+
+cat("\nRaster catalogue:\n")
+
+print(
+  as.data.frame(raster_catalogue),
+  row.names = FALSE
+)
+
+write_csv(
+  raster_catalogue,
+  file.path(
+    table_out_dir,
+    paste0(
+      aoi_name,
+      "_raster_catalogue.csv"
+    )
+  )
+)
+
+# ------------------------------------------------------------
+# 4. READ, REPAIR AND DISSOLVE AOI
+# ------------------------------------------------------------
+
+if (!file.exists(aoi_file)) {
+  stop(
+    "AOI file not found:\n",
+    aoi_file
+  )
+}
+
+available_layers <- st_layers(
+  aoi_file
+)$name
+
+cat("\nLayers in AOI file:\n")
+print(available_layers)
+
+if (!aoi_layer %in% available_layers) {
+  stop(
+    "Layer '",
+    aoi_layer,
+    "' was not found.\n",
+    "Available layers:\n",
+    paste(
+      available_layers,
+      collapse = "\n"
+    )
+  )
+}
+
+aoi_raw <- st_read(
+  aoi_file,
+  layer = aoi_layer,
+  quiet = FALSE
+)
+
+cat(
+  "\nNumber of original AOI features:",
+  nrow(aoi_raw),
+  "\n"
+)
+
+if (is.na(st_crs(aoi_raw))) {
+  stop(
+    "The AOI has no defined coordinate reference system."
+  )
+}
+
+aoi_raw <- aoi_raw[
+  !is.na(st_geometry(aoi_raw)) &
+    !st_is_empty(st_geometry(aoi_raw)),
+]
+
+if (nrow(aoi_raw) == 0) {
+  stop(
+    "No valid AOI geometries were found."
+  )
+}
+
+# ------------------------------------------------------------
+# This version expects polygon data.
+#
+# Shapefiles, KML and other sf-readable polygon formats can
+# use the same subsequent workflow. Point buffering can be
+# added separately when required.
+# ------------------------------------------------------------
+
+geometry_types <- unique(
+  as.character(
+    st_geometry_type(aoi_raw)
+  )
+)
+
+if (
+  !all(
+    geometry_types %in%
+      c(
+        "POLYGON",
+        "MULTIPOLYGON",
+        "GEOMETRYCOLLECTION"
+      )
+  )
+) {
+  stop(
+    "The current input must contain polygon geometry.\n",
+    "Geometry types found: ",
+    paste(
+      geometry_types,
+      collapse = ", "
+    )
+  )
+}
+
+# Repair in UTM Zone 50N
+aoi_utm <- aoi_raw %>%
+  st_transform(32650) %>%
+  st_make_valid()
+
+aoi_utm <- suppressWarnings(
+  st_collection_extract(
+    aoi_utm,
+    "POLYGON"
+  )
+)
+
+aoi_utm <- aoi_utm[
+  !st_is_empty(
+    st_geometry(aoi_utm)
+  ),
+]
+
+if (nrow(aoi_utm) == 0) {
+  stop(
+    "No polygons remained after geometry repair."
+  )
+}
+
+# Dissolve every source feature into one AOI
+aoi_union <- st_union(
+  st_geometry(aoi_utm)
+)
+
+aoi_union <- st_make_valid(
+  aoi_union
+)
+
+aoi_site_utm <- st_sf(
+  AOI_ID = str_replace_all(
+    aoi_name,
+    "[^A-Za-z0-9]+",
+    "_"
+  ),
+
+  AOI_NAME = aoi_name,
+
+  geometry = aoi_union
+)
+
+aoi_site_utm$AOI_AREA_HA_VECTOR <-
+  as.numeric(
+    st_area(aoi_site_utm)
+  ) / 10000
+
+aoi_site <- st_transform(
+  aoi_site_utm,
+  4326
+)
+
+cat(
+  "\nNumber of dissolved assessment units:",
+  nrow(aoi_site),
+  "\n"
+)
+
+cat(
+  "AOI area:",
+  round(
+    aoi_site_utm$AOI_AREA_HA_VECTOR,
+    3
+  ),
+  "ha\n"
+)
+
+# Save dissolved AOI
+aoi_output_file <- file.path(
+  vector_out_dir,
+  paste0(
+    aoi_name,
+    "_dissolved_AOI.gpkg"
+  )
+)
+
+if (file.exists(aoi_output_file)) {
+  file.remove(aoi_output_file)
+}
+
+st_write(
+  aoi_site,
+  aoi_output_file,
+  layer = paste0(
+    aoi_name,
+    "_AOI"
+  ),
+  delete_dsn = TRUE,
+  quiet = FALSE
+)
+
+# ------------------------------------------------------------
+# 5. SAFE SUMMARY FUNCTIONS
+# ------------------------------------------------------------
+
+safe_mean <- function(x) {
+  if (all(is.na(x))) {
+    NA_real_
+  } else {
+    mean(x, na.rm = TRUE)
+  }
+}
+
+safe_median <- function(x) {
+  if (all(is.na(x))) {
+    NA_real_
+  } else {
+    median(x, na.rm = TRUE)
+  }
+}
+
+safe_quantile <- function(x, probability) {
+  if (all(is.na(x))) {
+    NA_real_
+  } else {
+    as.numeric(
+      quantile(
+        x,
+        probs = probability,
+        na.rm = TRUE,
+        names = FALSE
+      )
+    )
+  }
+}
+
+safe_min <- function(x) {
+  if (all(is.na(x))) {
+    NA_real_
+  } else {
+    min(x, na.rm = TRUE)
+  }
+}
+
+safe_max <- function(x) {
+  if (all(is.na(x))) {
+    NA_real_
+  } else {
+    max(x, na.rm = TRUE)
+  }
+}
+
+# ------------------------------------------------------------
+# 6. EXACTEXTRACTR + CROPPED-RASTER FUNCTION
+# ------------------------------------------------------------
+
+process_aoi_raster <- function(
+    raster_file,
+    indicator,
+    scenario,
+    period,
+    aoi_sf,
+    output_directory
+) {
+
+  cat(
+    "\n----------------------------------------\n"
+  )
+
+  cat(
+    "Processing: ",
+    indicator,
+    " | ",
+    scenario,
+    " | ",
+    period,
+    "\n",
+    sep = ""
+  )
+
+  cat(
+    "Input: ",
+    basename(raster_file),
+    "\n",
+    sep = ""
+  )
+
+  r <- rast(
+    raster_file
+  )
+
+  if (nlyr(r) != 1) {
+    stop(
+      "Expected one raster layer in:\n",
+      raster_file,
+      "\nLayers found: ",
+      nlyr(r)
+    )
+  }
+
+  # Give every raster the same temporary layer name.
+  names(r) <- "raster_value"
+
+  # Transform AOI to raster CRS
+  aoi_raster_crs <- st_transform(
+    aoi_sf,
+    crs(r)
+  )
+
+  aoi_vect <- vect(
+    aoi_raster_crs
+  )
+
+  # Check spatial overlap
+  raster_extent_polygon <- as.polygons(
+    ext(r),
+    crs = crs(r)
+  )
+
+  overlaps <- relate(
+    aoi_vect,
+    raster_extent_polygon,
+    relation = "intersects"
+  )
+
+  if (!any(overlaps)) {
+    stop(
+      "The AOI does not overlap raster:\n",
+      raster_file
+    )
+  }
+
+  # ----------------------------------------------------------
+  # CROP AND MASK THE ORIGINAL RASTER
+  # ----------------------------------------------------------
+
+  r_crop <- crop(
+    r,
+    aoi_vect,
+    snap = "out"
+  )
+
+  if (ncell(r_crop) == 0) {
+    stop(
+      "Cropping produced no cells for:\n",
+      raster_file
+    )
+  }
+
+  r_crop <- mask(
+    r_crop,
+    aoi_vect
+  )
+
+  scenario_label <- if_else(
+    scenario == "baseline",
+    "historical",
+    scenario
+  )
+
+  output_raster_name <- paste0(
+    aoi_name,
+    "_",
+    indicator,
+    "_",
+    scenario_label,
+    "_",
+    period,
+    "_cropped.tif"
+  )
+
+  output_raster_file <- file.path(
+    output_directory,
+    output_raster_name
+  )
+
+  # Float output is suitable for all indicators.
+  # NAflag writes outside-AOI NoData as -9999.
+  writeRaster(
+    r_crop,
+    output_raster_file,
+    overwrite = TRUE,
+    datatype = "FLT4S",
+    NAflag = -9999,
+    gdal = c(
+      "COMPRESS=LZW",
+      "TILED=YES"
+    )
+  )
+
+  # ----------------------------------------------------------
+  # EXACT AREA-WEIGHTED EXTRACTION
+  # ----------------------------------------------------------
+
+  extraction <- exact_extract(
+    r,
+    aoi_raster_crs,
+    include_area = TRUE,
+    progress = FALSE
+  )[[1]]
+
+  if (
+    is.null(extraction) ||
+      nrow(extraction) == 0
+  ) {
+
+    return(
+      tibble(
+        AOI_ID = aoi_sf$AOI_ID,
+        AOI_NAME = aoi_sf$AOI_NAME,
+        AOI_AREA_HA_VECTOR =
+          aoi_sf$AOI_AREA_HA_VECTOR,
+        scenario = scenario,
+        period = period,
+        indicator = indicator,
+        mean = NA_real_,
+        weighted_mean = NA_real_,
+        median = NA_real_,
+        p75 = NA_real_,
+        p90 = NA_real_,
+        min = NA_real_,
+        max = NA_real_,
+        n_intersecting_cells = 0,
+        n_valid_cells = 0,
+        valid_covered_area_ha = 0,
+        cropped_raster =
+          output_raster_file
+      )
+    )
+  }
+
+  cat(
+    "Columns returned by exact_extract():\n"
+  )
+
+  print(
+    names(extraction)
+  )
+
+  # Identify the raster-value column automatically
+  information_columns <- c(
+    "coverage_fraction",
+    "area",
+    "x",
+    "y",
+    "cell"
+  )
+
+  value_columns <- setdiff(
+    names(extraction),
+    information_columns
+  )
+
+  if (length(value_columns) == 0) {
+    stop(
+      "No raster-value column was returned by exact_extract().\n",
+      "Columns found: ",
+      paste(
+        names(extraction),
+        collapse = ", "
+      )
+    )
+  }
+
+  raster_value_column <-
+    value_columns[1]
+
+  extraction <- extraction %>%
+    rename(
+      value =
+        all_of(raster_value_column)
+    ) %>%
+    mutate(
+      covered_area_m2 =
+        area *
+        coverage_fraction,
+
+      valid_covered_area_m2 =
+        if_else(
+          !is.na(value),
+          covered_area_m2,
+          0
+        ),
+
+      weighted_value =
+        if_else(
+          !is.na(value),
+          value *
+            covered_area_m2,
+          0
+        )
+    )
+
+  valid_area_m2 <- sum(
+    extraction$valid_covered_area_m2,
+    na.rm = TRUE
+  )
+
+  weighted_mean_value <- ifelse(
+    valid_area_m2 > 0,
+    sum(
+      extraction$weighted_value,
+      na.rm = TRUE
+    ) /
+      valid_area_m2,
+    NA_real_
+  )
+
+  valid_values <- extraction$value[
+    !is.na(extraction$value)
+  ]
+
+  result <- tibble(
+    AOI_ID =
+      aoi_sf$AOI_ID,
+
+    AOI_NAME =
+      aoi_sf$AOI_NAME,
+
+    AOI_AREA_HA_VECTOR =
+      aoi_sf$AOI_AREA_HA_VECTOR,
+
+    scenario =
+      scenario,
+
+    period =
+      period,
+
+    indicator =
+      indicator,
+
+    mean =
+      safe_mean(valid_values),
+
+    weighted_mean =
+      weighted_mean_value,
+
+    median =
+      safe_median(valid_values),
+
+    p75 =
+      safe_quantile(
+        valid_values,
+        0.75
+      ),
+
+    p90 =
+      safe_quantile(
+        valid_values,
+        0.90
+      ),
+
+    min =
+      safe_min(valid_values),
+
+    max =
+      safe_max(valid_values),
+
+    n_intersecting_cells =
+      nrow(extraction),
+
+    n_valid_cells =
+      sum(
+        !is.na(extraction$value)
+      ),
+
+    valid_covered_area_ha =
+      valid_area_m2 / 10000,
+
+    cropped_raster =
+      output_raster_file
+  )
+
+  cat(
+    "Area-weighted mean:",
+    round(
+      result$weighted_mean,
+      4
+    ),
+    "\n"
+  )
+
+  result
+}
+
+# ------------------------------------------------------------
+# 7. PROCESS ALL SELECTED RASTERS
+# ------------------------------------------------------------
+
+summary_long <- pmap_dfr(
+  raster_catalogue %>%
+    select(
+      raster_file,
+      indicator,
+      scenario,
+      period
+    ),
+
+  function(
+      raster_file,
+      indicator,
+      scenario,
+      period
+  ) {
+
+    process_aoi_raster(
+      raster_file = raster_file,
+      indicator = indicator,
+      scenario = scenario,
+      period = period,
+      aoi_sf = aoi_site,
+      output_directory =
+        raster_out_dir
+    )
+  }
+) %>%
+  mutate(
+    across(
+      c(
+        AOI_AREA_HA_VECTOR,
+        mean,
+        weighted_mean,
+        median,
+        p75,
+        p90,
+        min,
+        max,
+        valid_covered_area_ha
+      ),
+      ~ round(.x, 5)
+    )
+  ) %>%
+  arrange(
+    scenario,
+    period,
+    indicator
+  )
+
+long_report_file <- file.path(
+  table_out_dir,
+  paste0(
+    aoi_name,
+    "_drought_fire_summary_LONG.csv"
+  )
+)
+
+write_csv(
+  summary_long,
+  long_report_file
+)
+
+# ------------------------------------------------------------
+# 8. CREATE WIDE SUMMARY
+# ------------------------------------------------------------
+
+summary_wide <- summary_long %>%
+  mutate(
+    indicator_scenario_period =
+      paste(
+        indicator,
+        scenario,
+        period,
+        sep = "_"
+      )
+  ) %>%
+  select(
+    AOI_ID,
+    AOI_NAME,
+    AOI_AREA_HA_VECTOR,
+    indicator_scenario_period,
+    weighted_mean,
+    median,
+    p75,
+    p90,
+    min,
+    max,
+    n_valid_cells
+  ) %>%
+  pivot_wider(
+    names_from =
+      indicator_scenario_period,
+
+    values_from = c(
+      weighted_mean,
+      median,
+      p75,
+      p90,
+      min,
+      max,
+      n_valid_cells
+    ),
+
+    names_glue =
+      "{indicator_scenario_period}_{.value}"
+  )
+
+wide_report_file <- file.path(
+  table_out_dir,
+  paste0(
+    aoi_name,
+    "_drought_fire_summary_WIDE.csv"
+  )
+)
+
+write_csv(
+  summary_wide,
+  wide_report_file
+)
+
+# ------------------------------------------------------------
+# 9. BASELINE-TO-FUTURE CHANGE TABLE
+# ------------------------------------------------------------
+
+baseline_results <- summary_long %>%
+  filter(
+    scenario == "baseline"
+  ) %>%
+  select(
+    AOI_ID,
+    AOI_NAME,
+    AOI_AREA_HA_VECTOR,
+    indicator,
+    baseline_weighted_mean =
+      weighted_mean,
+    baseline_median =
+      median,
+    baseline_p90 =
+      p90
+  )
+
+future_results <- summary_long %>%
+  filter(
+    scenario != "baseline"
+  ) %>%
+  select(
+    AOI_ID,
+    AOI_NAME,
+    AOI_AREA_HA_VECTOR,
+    scenario,
+    period,
+    indicator,
+    future_weighted_mean =
+      weighted_mean,
+    future_median =
+      median,
+    future_p90 =
+      p90
+  )
+
+change_long <- future_results %>%
+  left_join(
+    baseline_results,
+    by = c(
+      "AOI_ID",
+      "AOI_NAME",
+      "AOI_AREA_HA_VECTOR",
+      "indicator"
+    )
+  ) %>%
+  mutate(
+    delta_weighted_mean =
+      future_weighted_mean -
+      baseline_weighted_mean,
+
+    percent_change_weighted_mean =
+      case_when(
+        is.na(
+          baseline_weighted_mean
+        ) ~
+          NA_real_,
+
+        baseline_weighted_mean == 0 ~
+          NA_real_,
+
+        TRUE ~
+          100 *
+          delta_weighted_mean /
+          baseline_weighted_mean
+      ),
+
+    delta_median =
+      future_median -
+      baseline_median,
+
+    delta_p90 =
+      future_p90 -
+      baseline_p90
+  ) %>%
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 5)
+    )
+  ) %>%
+  arrange(
+    scenario,
+    period,
+    indicator
+  )
+
+change_long_file <- file.path(
+  table_out_dir,
+  paste0(
+    aoi_name,
+    "_drought_fire_CHANGE_LONG.csv"
+  )
+)
+
+write_csv(
+  change_long,
+  change_long_file
+)
+
+# ------------------------------------------------------------
+# 10. DIRECT FIRE-RISK CLASSIFICATION
+# ------------------------------------------------------------
+#
+# The fire raster is assumed to be a 0-1 probability or
+# suitability surface.
+#
+# This is a direct classification and is valid for one AOI.
+# Relative quartile classification is not used.
+
+fire_probability_class <- function(x) {
+
+  case_when(
+    is.na(x) ~
+      NA_character_,
+
+    x < 0 | x > 1 ~
+      "Check fire raster value",
+
+    x <= 0.25 ~
+      "Low",
+
+    x <= 0.50 ~
+      "Moderate",
+
+    x <= 0.75 ~
+      "High",
+
+    x <= 1.00 ~
+      "Very High"
+  )
+}
+
+fire_report <- change_long %>%
+  filter(
+    indicator == "Fire"
+  ) %>%
+  mutate(
+    baseline_fire_class =
+      fire_probability_class(
+        baseline_weighted_mean
+      ),
+
+    future_fire_class =
+      fire_probability_class(
+        future_weighted_mean
+      ),
+
+    fire_change_interpretation =
+      case_when(
+        is.na(delta_weighted_mean) ~
+          NA_character_,
+
+        delta_weighted_mean > 0 ~
+          "Modelled fire probability increases from baseline.",
+
+        delta_weighted_mean < 0 ~
+          "Modelled fire probability decreases from baseline.",
+
+        TRUE ~
+          "No change in mean modelled fire probability."
+      )
+  )
+
+fire_report_file <- file.path(
+  table_out_dir,
+  paste0(
+    aoi_name,
+    "_fire_risk_report.csv"
+  )
+)
+
+write_csv(
+  fire_report,
+  fire_report_file
+)
+
+# ------------------------------------------------------------
+# 11. COMPACT DROUGHT AND FIRE REPORT
+# ------------------------------------------------------------
+
+compact_report <- change_long %>%
+  select(
+    AOI_NAME,
+    scenario,
+    period,
+    indicator,
+    baseline_weighted_mean,
+    future_weighted_mean,
+    delta_weighted_mean,
+    percent_change_weighted_mean,
+    baseline_p90,
+    future_p90,
+    delta_p90
+  ) %>%
+  arrange(
+    scenario,
+    period,
+    indicator
+  )
+
+compact_report_file <- file.path(
+  table_out_dir,
+  paste0(
+    aoi_name,
+    "_drought_fire_COMPACT_REPORT.csv"
+  )
+)
+
+write_csv(
+  compact_report,
+  compact_report_file
+)
+
+# ------------------------------------------------------------
+# 12. COMPLETION MESSAGE
+# ------------------------------------------------------------
+
+cat("\n")
+cat("========================================\n")
+cat("DROUGHT AND FIRE PROCESSING COMPLETE\n")
+cat("========================================\n")
+
+cat(
+  "\nAOI:",
+  aoi_name,
+  "\n"
+)
+
+cat(
+  "Original AOI features:",
+  nrow(aoi_raw),
+  "\n"
+)
+
+cat(
+  "Dissolved assessment units:",
+  nrow(aoi_site),
+  "\n"
+)
+
+cat(
+  "\nLong raster summary:\n",
+  long_report_file,
+  "\n"
+)
+
+cat(
+  "\nWide raster summary:\n",
+  wide_report_file,
+  "\n"
+)
+
+cat(
+  "\nBaseline-to-future change report:\n",
+  change_long_file,
+  "\n"
+)
+
+cat(
+  "\nCompact report:\n",
+  compact_report_file,
+  "\n"
+)
+
+cat(
+  "\nFire-risk report:\n",
+  fire_report_file,
+  "\n"
+)
+
+cat(
+  "\nCropped rasters:\n",
+  raster_out_dir,
+  "\n"
+)
+
+cat(
+  "\nDissolved AOI:\n",
+  aoi_output_file,
+  "\n"
+)
