@@ -20,17 +20,17 @@ library(tidyr)
 # ------------------------------------------------------------
 # 0. USER SETTINGS
 # ------------------------------------------------------------
-base_dir <- "C:/Users/User/Documents/Climate_GT"
-SLR_base <- "C:/Users/User/Documents/Peatland/Climate"
+base_dir <- "C:/Users/User/Documents/Climate_GT" # change to the directory with your vector file 
+SLR_base <- "C:/Users/User/Documents/Peatland/Climate" # change to the directory with the SLR & storm surge rasters
 
 # GeoPackage file
 Jam_gpkg <- file.path(
   base_dir,
-  "Jambongan.gpkg"
+  "Jambongan.gpkg" # change to name of your file and change to file type
 )
 
 # Layer inside the GeoPackage
-Jam_layer <- "Jambongan"
+Jam_layer <- "Jambongan" # not required if using a shapefile
 
 # Folder containing the inundation rasters
 coastal_dir <- file.path(
@@ -67,7 +67,7 @@ coastal_files <- file.path(
 out_dir <- file.path(
   base_dir,
   "outputs",
-  "Jambongan_SLR"
+  "Jambongan_SLR" # change to your AOI
 )
 
 table_out_dir <- file.path(
