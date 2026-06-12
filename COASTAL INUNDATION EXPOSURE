@@ -1,0 +1,1053 @@
+# ============================================================
+# COASTAL INUNDATION EXPOSURE
+#
+# Outputs:
+# 1. One dissolved assessment boundary (fixs issues with the geometry of the vector file)
+# 2. Exposure results for all eight return periods
+# 3. Long-format CSV report
+# 4. Summary CSV report
+# 5. Cropped and masked raster for each return period
+# ============================================================
+
+library(sf)
+library(terra)
+library(exactextractr)
+library(dplyr)
+library(purrr)
+library(readr)
+library(tidyr)
+
+# ------------------------------------------------------------
+# 0. USER SETTINGS
+# ------------------------------------------------------------
+base_dir <- "C:/Users/User/Documents/Climate_GT"
+SLR_base <- "C:/Users/User/Documents/Peatland/Climate"
+
+# GeoPackage file
+Jam_gpkg <- file.path(
+  base_dir,
+  "Jambongan.gpkg"
+)
+
+# Layer inside the GeoPackage
+Jam_layer <- "Jambongan"
+
+# Folder containing the inundation rasters
+coastal_dir <- file.path(
+  SLR_base,
+  "SLR"
+)
+
+# Return periods
+return_periods <- c(
+  1,
+  2,
+  5,
+  10,
+  25,
+  50,
+  75,
+  100
+)
+
+# Input raster paths
+coastal_files <- file.path(
+  coastal_dir,
+  paste0(
+    "Inundation_2021-2050_rp",
+    return_periods,
+    ".tif"
+  )
+)
+
+# ------------------------------------------------------------
+# OUTPUT FOLDERS
+# ------------------------------------------------------------
+
+out_dir <- file.path(
+  base_dir,
+  "outputs",
+  "Jambongan_SLR"
+)
+
+table_out_dir <- file.path(
+  out_dir,
+  "tables"
+)
+
+raster_out_dir <- file.path(
+  out_dir,
+  "cropped_rasters"
+)
+
+vector_out_dir <- file.path(
+  out_dir,
+  "vectors"
+)
+
+dir.create(
+  table_out_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  raster_out_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  vector_out_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# ------------------------------------------------------------
+# 1. CHECK INPUT FILES
+# ------------------------------------------------------------
+
+if (!file.exists(Jam_gpkg)) {
+  stop(
+    "Jambongan GeoPackage not found:\n",
+    Jam_gpkg
+  )
+}
+
+available_layers <- st_layers(Jam_gpkg)$name
+
+cat("\nLayers found in the GeoPackage:\n")
+print(available_layers)
+
+if (!Jam_layer %in% available_layers) {
+  stop(
+    "\nLayer '",
+    Jam_layer,
+    "' was not found in:\n",
+    Jam_gpkg,
+    "\n\nAvailable layers:\n",
+    paste(
+      available_layers,
+      collapse = "\n"
+    )
+  )
+}
+
+missing_coastal <- coastal_files[
+  !file.exists(coastal_files)
+]
+
+if (length(missing_coastal) > 0) {
+  stop(
+    "\nThe following inundation rasters are missing:\n",
+    paste(
+      missing_coastal,
+      collapse = "\n"
+    )
+  )
+}
+
+cat("\nAll eight inundation rasters were found:\n")
+
+print(
+  data.frame(
+    return_period = return_periods,
+    raster_file = coastal_files
+  )
+)
+
+# ------------------------------------------------------------
+# 2. READ geopackage
+# ------------------------------------------------------------
+
+sf_use_s2(FALSE)
+
+Jam_raw <- st_read(
+  Jam_gpkg,
+  layer = Jam_layer,
+  quiet = FALSE
+)
+
+cat(
+  "\nNumber of source features in Jambongan:",
+  nrow(Jam_raw),
+  "\n"
+)
+
+cat("\nSource geometry types:\n")
+
+print(
+  table(
+    st_geometry_type(Jam_raw)
+  )
+)
+
+# Remove missing and empty geometries
+Jam_raw <- Jam_raw[
+  !is.na(st_geometry(Jam_raw)) &
+    !st_is_empty(st_geometry(Jam_raw)),
+]
+
+if (nrow(Jam_raw) == 0) {
+  stop(
+    "No valid polygon features were found in the Jambongan layer."
+  )
+}
+
+# ------------------------------------------------------------
+# 3. REPAIR AND DISSOLVE INTO ONE SITE
+# ------------------------------------------------------------
+
+# Jambongan is in UTM Zone 50N
+Jam_utm <- Jam_raw %>%
+  st_transform(32650) %>%
+  st_make_valid()
+
+# Extract polygon components where geometry collections exist
+Jam_utm <- suppressWarnings(
+  st_collection_extract(
+    Jam_utm,
+    "POLYGON"
+  )
+)
+
+Jam_utm <- Jam_utm[
+  !st_is_empty(st_geometry(Jam_utm)),
+]
+
+if (nrow(Jam_utm) == 0) {
+  stop(
+    "No polygon geometries remained after geometry repair."
+  )
+}
+
+# Dissolve all polygons into one geometry
+Jam_union <- st_union(
+  st_geometry(Jam_utm)
+)
+
+Jam_union <- st_make_valid(
+  Jam_union
+)
+
+# Create one-feature assessment layer
+Jam_site_utm <- st_sf(
+  SITE_ID = "Jambongan",
+  SITE_NAME = "Jambongan",
+  geometry = Jam_union
+)
+
+# Calculate vector area
+Jam_site_utm$SITE_AREA_HA_VECTOR <-
+  as.numeric(
+    st_area(Jam_site_utm)
+  ) / 10000
+
+cat(
+  "\nNumber of assessment sites after dissolving:",
+  nrow(Jam_site_utm),
+  "\n"
+)
+
+cat(
+  "Jambongan vector area:",
+  round(
+    Jam_site_utm$SITE_AREA_HA_VECTOR,
+    2
+  ),
+  "ha\n"
+)
+
+# WGS84 version for saving and viewing
+Jam_site <- st_transform(
+  Jam_site_utm,
+  4326
+)
+
+# ------------------------------------------------------------
+# 4. SAVE DISSOLVED JAMBONGAN BOUNDARY
+# ------------------------------------------------------------
+
+dissolved_gpkg <- file.path(
+  vector_out_dir,
+  "Jambongan_dissolved_site.gpkg"
+)
+
+if (file.exists(dissolved_gpkg)) {
+  file.remove(dissolved_gpkg)
+}
+
+st_write(
+  Jam_site,
+  dissolved_gpkg,
+  layer = "Jambongan_dissolved",
+  delete_dsn = TRUE,
+  quiet = FALSE
+)
+
+cat(
+  "\nDissolved Jambongan boundary saved to:\n",
+  dissolved_gpkg,
+  "\n"
+)
+
+# ------------------------------------------------------------
+# 5. EXPOSURE CALCULATION FUNCTION
+# ------------------------------------------------------------
+
+calculate_slr_exposure <- function(
+    raster_file,
+    return_period,
+    site_sf,
+    raster_output_directory
+) {
+  
+  cat(
+    "\n----------------------------------------\n"
+  )
+  
+  cat(
+    "Processing RP",
+    return_period,
+    ": ",
+    basename(raster_file),
+    "\n",
+    sep = ""
+  )
+  
+  # Read inundation raster
+  slr <- rast(raster_file)
+  
+  if (nlyr(slr) != 1) {
+    stop(
+      "Expected one raster layer, but found ",
+      nlyr(slr),
+      " layers in ",
+      basename(raster_file)
+    )
+  }
+  
+  cat("Raster CRS:\n")
+  print(crs(slr))
+  
+  cat("Raster resolution:\n")
+  print(res(slr))
+  
+  # Transform site into raster CRS
+  site_raster_crs <- st_transform(
+    site_sf,
+    crs(slr)
+  )
+  
+  site_vect <- vect(
+    site_raster_crs
+  )
+  
+  # Check for spatial overlap
+  raster_extent_polygon <- as.polygons(
+    ext(slr),
+    crs = crs(slr)
+  )
+  
+  site_overlap <- relate(
+    site_vect,
+    raster_extent_polygon,
+    relation = "intersects"
+  )
+  
+  if (!any(site_overlap)) {
+    warning(
+      "Jambongan does not overlap raster ",
+      basename(raster_file)
+    )
+    
+    return(
+      tibble(
+        SITE_ID = site_sf$SITE_ID,
+        SITE_NAME = site_sf$SITE_NAME,
+        return_period = return_period,
+        SITE_AREA_HA_VECTOR =
+          site_sf$SITE_AREA_HA_VECTOR,
+        SITE_AREA_HA_RASTER = 0,
+        exposed_area_ha = 0,
+        pct_exposed = 0,
+        n_intersecting_cells = 0,
+        n_exposed_cells = 0,
+        cropped_raster = NA_character_
+      )
+    )
+  }
+  
+  # ----------------------------------------------------------
+  # CREATE BINARY EXPOSURE RASTER
+  #
+  # 1 = inundated
+  # 0 = not inundated
+  #
+  # Raster nodata and large negative fill values become 0.
+  # ----------------------------------------------------------
+  
+  exposed <- ifel(
+    !is.na(slr) & slr == 1,
+    1,
+    0
+  )
+  
+  names(exposed) <- "inundated"
+  
+  # ----------------------------------------------------------
+  # CREATE CROPPED AND MASKED OUTPUT RASTER
+  # ----------------------------------------------------------
+  
+  exposed_crop <- crop(
+    exposed,
+    site_vect,
+    snap = "out"
+  )
+  
+  if (ncell(exposed_crop) == 0) {
+    warning(
+      "The crop returned no raster cells for RP",
+      return_period
+    )
+    
+    return(
+      tibble(
+        SITE_ID = site_sf$SITE_ID,
+        SITE_NAME = site_sf$SITE_NAME,
+        return_period = return_period,
+        SITE_AREA_HA_VECTOR =
+          site_sf$SITE_AREA_HA_VECTOR,
+        SITE_AREA_HA_RASTER = 0,
+        exposed_area_ha = 0,
+        pct_exposed = 0,
+        n_intersecting_cells = 0,
+        n_exposed_cells = 0,
+        cropped_raster = NA_character_
+      )
+    )
+  }
+  
+  exposed_crop <- mask(
+    exposed_crop,
+    site_vect
+  )
+  
+  cropped_file <- file.path(
+    raster_output_directory,
+    paste0(
+      "Jambongan_Inundation_2021-2050_RP",
+      return_period,
+      "_cropped.tif"
+    )
+  )
+  
+  writeRaster(
+    exposed_crop,
+    cropped_file,
+    overwrite = TRUE,
+    datatype = "INT2S",
+    NAflag = -9999,
+    gdal = c(
+      "COMPRESS=LZW",
+      "TILED=YES"
+    )
+  )
+  
+  # ----------------------------------------------------------
+  # EXACTEXTRACTR EXTRACTION
+  # ----------------------------------------------------------
+  
+  extraction <- exact_extract(
+    exposed,
+    site_raster_crs,
+    include_area = TRUE,
+    progress = FALSE
+  )[[1]]
+  
+  if (
+    is.null(extraction) ||
+    nrow(extraction) == 0
+  ) {
+    
+    return(
+      tibble(
+        SITE_ID = site_sf$SITE_ID,
+        SITE_NAME = site_sf$SITE_NAME,
+        return_period = return_period,
+        SITE_AREA_HA_VECTOR =
+          site_sf$SITE_AREA_HA_VECTOR,
+        SITE_AREA_HA_RASTER = 0,
+        exposed_area_ha = 0,
+        pct_exposed = 0,
+        n_intersecting_cells = 0,
+        n_exposed_cells = 0,
+        cropped_raster = cropped_file
+      )
+    )
+  }
+  
+  cat(
+    "Columns returned by exact_extract():\n"
+  )
+  
+  print(
+    names(extraction)
+  )
+  
+  # ----------------------------------------------------------
+  # FIND THE RASTER VALUE COLUMN
+  #
+  # Depending on package versions, the value column may be
+  # named:
+  # inundated
+  # value
+  # lyr.1
+  # or another raster-derived name.
+  # ----------------------------------------------------------
+  
+  known_information_columns <- c(
+    "coverage_fraction",
+    "area",
+    "x",
+    "y",
+    "cell"
+  )
+  
+  value_columns <- setdiff(
+    names(extraction),
+    known_information_columns
+  )
+  
+  if (length(value_columns) == 0) {
+    stop(
+      "No raster-value column was returned by exact_extract().\n",
+      "Columns found:\n",
+      paste(
+        names(extraction),
+        collapse = ", "
+      )
+    )
+  }
+  
+  # There should only be one raster-value column because
+  # one raster layer is processed at a time.
+  raster_value_column <- value_columns[1]
+  
+  cat(
+    "Using raster-value column: ",
+    raster_value_column,
+    "\n",
+    sep = ""
+  )
+  
+  extraction <- extraction %>%
+    rename(
+      inundated =
+        all_of(raster_value_column)
+    )
+  
+  # Make certain the required columns exist
+  if (
+    !"coverage_fraction" %in%
+    names(extraction)
+  ) {
+    stop(
+      "coverage_fraction was not returned by exact_extract()."
+    )
+  }
+  
+  if (!"area" %in% names(extraction)) {
+    stop(
+      "Cell area was not returned by exact_extract()."
+    )
+  }
+  
+  # ----------------------------------------------------------
+  # CALCULATE AREA
+  #
+  # covered_area_m2:
+  # cell area multiplied by the fraction of the cell covered
+  # by Jambongan.
+  #
+  # exposed_covered_area_m2:
+  # covered area where the raster value equals 1.
+  # ----------------------------------------------------------
+  
+  extraction <- extraction %>%
+    mutate(
+      covered_area_m2 =
+        area * coverage_fraction,
+      
+      exposed_covered_area_m2 =
+        case_when(
+          !is.na(inundated) &
+            inundated == 1 ~
+            covered_area_m2,
+          
+          TRUE ~ 0
+        )
+    )
+  
+  site_area_raster_ha <-
+    sum(
+      extraction$covered_area_m2,
+      na.rm = TRUE
+    ) / 10000
+  
+  exposed_area_ha <-
+    sum(
+      extraction$exposed_covered_area_m2,
+      na.rm = TRUE
+    ) / 10000
+  
+  pct_exposed <- ifelse(
+    site_area_raster_ha > 0,
+    100 *
+      exposed_area_ha /
+      site_area_raster_ha,
+    0
+  )
+  
+  # Prevent tiny numerical errors outside 0–100
+  pct_exposed <- pmin(
+    pmax(
+      pct_exposed,
+      0
+    ),
+    100
+  )
+  
+  n_exposed_cells <- sum(
+    !is.na(extraction$inundated) &
+      extraction$inundated == 1 &
+      extraction$coverage_fraction > 0,
+    na.rm = TRUE
+  )
+  
+  cat(
+    "Raster-based site area:",
+    round(site_area_raster_ha, 2),
+    "ha\n"
+  )
+  
+  cat(
+    "Exposed area:",
+    round(exposed_area_ha, 2),
+    "ha\n"
+  )
+  
+  cat(
+    "Percentage exposed:",
+    round(pct_exposed, 2),
+    "%\n"
+  )
+  
+  tibble(
+    SITE_ID = site_sf$SITE_ID,
+    SITE_NAME = site_sf$SITE_NAME,
+    return_period = return_period,
+    
+    SITE_AREA_HA_VECTOR =
+      site_sf$SITE_AREA_HA_VECTOR,
+    
+    SITE_AREA_HA_RASTER =
+      site_area_raster_ha,
+    
+    exposed_area_ha =
+      exposed_area_ha,
+    
+    pct_exposed =
+      pct_exposed,
+    
+    n_intersecting_cells =
+      nrow(extraction),
+    
+    n_exposed_cells =
+      n_exposed_cells,
+    
+    cropped_raster =
+      cropped_file
+  )
+}
+
+# ------------------------------------------------------------
+# 6. RUN ALL EIGHT RETURN PERIODS
+# ------------------------------------------------------------
+
+coastal_exposure_long <- map2_dfr(
+  coastal_files,
+  return_periods,
+  ~ calculate_slr_exposure(
+    raster_file = .x,
+    return_period = .y,
+    site_sf = Jam_site,
+    raster_output_directory =
+      raster_out_dir
+  )
+) %>%
+  mutate(
+    SITE_AREA_HA_VECTOR =
+      round(
+        SITE_AREA_HA_VECTOR,
+        3
+      ),
+    
+    SITE_AREA_HA_RASTER =
+      round(
+        SITE_AREA_HA_RASTER,
+        3
+      ),
+    
+    exposed_area_ha =
+      round(
+        exposed_area_ha,
+        3
+      ),
+    
+    pct_exposed =
+      round(
+        pct_exposed,
+        3
+      )
+  ) %>%
+  arrange(
+    return_period
+  )
+
+cat("\nExposure results:\n")
+
+print(
+  as.data.frame(coastal_exposure_long),
+  row.names = FALSE
+)
+
+# Save long-format report
+long_report_file <- file.path(
+  table_out_dir,
+  "Jambongan_SLR_exposure_LONG.csv"
+)
+
+write_csv(
+  coastal_exposure_long,
+  long_report_file
+)
+
+# ------------------------------------------------------------
+# 7. CREATE SUMMARY REPORT
+# ------------------------------------------------------------
+
+coastal_summary <- coastal_exposure_long %>%
+  summarise(
+    SITE_ID =
+      first(SITE_ID),
+    
+    SITE_NAME =
+      first(SITE_NAME),
+    
+    SITE_AREA_HA_VECTOR =
+      first(SITE_AREA_HA_VECTOR),
+    
+    mean_SITE_AREA_HA_RASTER =
+      mean(
+        SITE_AREA_HA_RASTER,
+        na.rm = TRUE
+      ),
+    
+    lowest_return_period_exposed =
+      ifelse(
+        any(
+          exposed_area_ha > 0,
+          na.rm = TRUE
+        ),
+        
+        min(
+          return_period[
+            exposed_area_ha > 0
+          ],
+          na.rm = TRUE
+        ),
+        
+        NA_real_
+      ),
+    
+    maximum_exposed_area_ha =
+      max(
+        exposed_area_ha,
+        na.rm = TRUE
+      ),
+    
+    maximum_pct_exposed =
+      max(
+        pct_exposed,
+        na.rm = TRUE
+      ),
+    
+    area_exposed_RP1 =
+      exposed_area_ha[
+        return_period == 1
+      ][1],
+    
+    area_exposed_RP2 =
+      exposed_area_ha[
+        return_period == 2
+      ][1],
+    
+    area_exposed_RP5 =
+      exposed_area_ha[
+        return_period == 5
+      ][1],
+    
+    area_exposed_RP10 =
+      exposed_area_ha[
+        return_period == 10
+      ][1],
+    
+    area_exposed_RP25 =
+      exposed_area_ha[
+        return_period == 25
+      ][1],
+    
+    area_exposed_RP50 =
+      exposed_area_ha[
+        return_period == 50
+      ][1],
+    
+    area_exposed_RP75 =
+      exposed_area_ha[
+        return_period == 75
+      ][1],
+    
+    area_exposed_RP100 =
+      exposed_area_ha[
+        return_period == 100
+      ][1],
+    
+    pct_exposed_RP1 =
+      pct_exposed[
+        return_period == 1
+      ][1],
+    
+    pct_exposed_RP2 =
+      pct_exposed[
+        return_period == 2
+      ][1],
+    
+    pct_exposed_RP5 =
+      pct_exposed[
+        return_period == 5
+      ][1],
+    
+    pct_exposed_RP10 =
+      pct_exposed[
+        return_period == 10
+      ][1],
+    
+    pct_exposed_RP25 =
+      pct_exposed[
+        return_period == 25
+      ][1],
+    
+    pct_exposed_RP50 =
+      pct_exposed[
+        return_period == 50
+      ][1],
+    
+    pct_exposed_RP75 =
+      pct_exposed[
+        return_period == 75
+      ][1],
+    
+    pct_exposed_RP100 =
+      pct_exposed[
+        return_period == 100
+      ][1]
+  ) %>%
+  mutate(
+    frequency_class = case_when(
+      is.na(
+        lowest_return_period_exposed
+      ) ~
+        "No mapped exposure",
+      
+      lowest_return_period_exposed <= 2 ~
+        "Very high - frequent exposure",
+      
+      lowest_return_period_exposed <= 10 ~
+        "High - regular episodic exposure",
+      
+      lowest_return_period_exposed <= 50 ~
+        "Moderate - occasional extreme exposure",
+      
+      lowest_return_period_exposed <= 100 ~
+        "Low - rare extreme exposure",
+      
+      TRUE ~
+        "No mapped exposure"
+    ),
+    
+    area_class = case_when(
+      maximum_pct_exposed <= 0 ~
+        "No mapped exposure",
+      
+      maximum_pct_exposed > 50 ~
+        "Very high area exposed",
+      
+      maximum_pct_exposed > 20 ~
+        "High area exposed",
+      
+      maximum_pct_exposed > 5 ~
+        "Moderate area exposed",
+      
+      TRUE ~
+        "Low area exposed"
+    ),
+    
+    coastal_exposure_interpretation =
+      case_when(
+        frequency_class ==
+          "No mapped exposure" ~
+          paste(
+            "No mapped coastal inundation",
+            "exposure was identified within",
+            "the Jambongan assessment area."
+          ),
+        
+        lowest_return_period_exposed <= 2 &
+          maximum_pct_exposed > 20 ~
+          paste(
+            "Jambongan has frequent and",
+            "spatially substantial mapped",
+            "coastal inundation exposure."
+          ),
+        
+        lowest_return_period_exposed <= 10 ~
+          paste(
+            "Jambongan has regular mapped",
+            "coastal inundation exposure.",
+            "The affected area varies among",
+            "return periods."
+          ),
+        
+        maximum_pct_exposed > 20 ~
+          paste(
+            "A substantial part of Jambongan",
+            "is exposed during less frequent",
+            "extreme coastal inundation events."
+          ),
+        
+        TRUE ~
+          paste(
+            "Mapped coastal inundation exposure",
+            "is limited or mainly associated",
+            "with uncommon extreme events."
+          )
+      )
+  ) %>%
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 3)
+    )
+  )
+
+summary_report_file <- file.path(
+  table_out_dir,
+  "Jambongan_SLR_exposure_SUMMARY.csv"
+)
+
+write_csv(
+  coastal_summary,
+  summary_report_file
+)
+
+# ------------------------------------------------------------
+# 8. CREATE WIDE RETURN-PERIOD REPORT
+# ------------------------------------------------------------
+
+coastal_report_wide <- coastal_exposure_long %>%
+  select(
+    SITE_ID,
+    SITE_NAME,
+    return_period,
+    SITE_AREA_HA_VECTOR,
+    SITE_AREA_HA_RASTER,
+    exposed_area_ha,
+    pct_exposed,
+    n_exposed_cells
+  ) %>%
+  pivot_wider(
+    id_cols = c(
+      SITE_ID,
+      SITE_NAME,
+      SITE_AREA_HA_VECTOR
+    ),
+    
+    names_from =
+      return_period,
+    
+    values_from = c(
+      SITE_AREA_HA_RASTER,
+      exposed_area_ha,
+      pct_exposed,
+      n_exposed_cells
+    ),
+    
+    names_glue =
+      "{.value}_RP{return_period}"
+  )
+
+wide_report_file <- file.path(
+  table_out_dir,
+  "Jambongan_SLR_exposure_WIDE.csv"
+)
+
+write_csv(
+  coastal_report_wide,
+  wide_report_file
+)
+
+# ------------------------------------------------------------
+# 9. COMPLETION MESSAGE
+# ------------------------------------------------------------
+
+cat("\n")
+cat("========================================\n")
+cat("JAMBONGAN SLR PROCESSING COMPLETE\n")
+cat("========================================\n")
+
+cat(
+  "\nSource features dissolved into:",
+  nrow(Jam_site),
+  "assessment site\n"
+)
+
+cat(
+  "\nLong-format report:\n",
+  long_report_file,
+  "\n"
+)
+
+cat(
+  "\nSummary report:\n",
+  summary_report_file,
+  "\n"
+)
+
+cat(
+  "\nWide-format report:\n",
+  wide_report_file,
+  "\n"
+)
+
+cat(
+  "\nCropped inundation rasters:\n",
+  raster_out_dir,
+  "\n"
+)
+
+cat(
+  "\nDissolved Jambongan boundary:\n",
+  dissolved_gpkg,
+  "\n"
+)
